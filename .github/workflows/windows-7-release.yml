@@ -95,7 +95,42 @@ jobs:
 
           $archive = Join-Path $env:RUNNER_TEMP $asset.name
           $kitRoot = Join-Path $env:RUNNER_TEMP "w64devkit"
-          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $archive
+          $downloaded = $false
+          for ($attempt = 1; $attempt -le 5; $attempt++) {
+            try {
+              Invoke-WebRequest `
+                -Uri $asset.browser_download_url `
+                -OutFile $archive `
+                -TimeoutSec 120 `
+                -ErrorAction Stop | Out-Null
+
+              $actualDigest = (Get-FileHash -Path $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+              if ($asset.digest -and $asset.digest -ne "sha256:$actualDigest") {
+                throw "Downloaded w64devkit archive did not match the release SHA-256 digest."
+              }
+
+              $signature = [System.IO.File]::ReadAllBytes($archive)
+              if ($signature.Length -lt 2 -or $signature[0] -ne 0x4D -or $signature[1] -ne 0x5A) {
+                throw "Downloaded w64devkit asset is not a Windows self-extracting archive."
+              }
+
+              $downloaded = $true
+              break
+            }
+            catch {
+              Remove-Item -Path $archive -Force -ErrorAction SilentlyContinue
+              if ($attempt -eq 5) {
+                throw "Failed to download and verify w64devkit after $attempt attempts: $($_.Exception.Message)"
+              }
+
+              $delay = [Math]::Min(30, [Math]::Pow(2, $attempt))
+              Write-Warning "w64devkit download attempt $attempt failed. Retrying in $delay seconds."
+              Start-Sleep -Seconds $delay
+            }
+          }
+          if (-not $downloaded) {
+            throw "Failed to download w64devkit."
+          }
 
           $sevenZipCommand = Get-Command 7z.exe -ErrorAction SilentlyContinue
           if ($null -ne $sevenZipCommand) {
