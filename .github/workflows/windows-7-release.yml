@@ -74,6 +74,70 @@ jobs:
           path: llama.cpp
           persist-credentials: false
 
+      - name: Patch cpp-httplib for Windows 7
+        if: steps.existing.outputs.exists != 'true'
+        shell: pwsh
+        run: |
+          $headerPath = "llama.cpp\vendor\cpp-httplib\httplib.h"
+          $sourcePath = "llama.cpp\vendor\cpp-httplib\httplib.cpp"
+          $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+          $header = [System.IO.File]::ReadAllText($headerPath).Replace("`r`n", "`n")
+          $source = [System.IO.File]::ReadAllText($sourcePath).Replace("`r`n", "`n")
+
+          $versionGuard = '(?m)^#ifdef _WIN32\n#if defined\(_WIN32_WINNT\) && _WIN32_WINNT < 0x0A00\n#error[ \t]*\\\n[ \t]*"cpp-httplib doesn''t support Windows 8 or lower\. Please use Windows 10 or later\."\n#endif\n#endif\n?'
+          if ([regex]::Matches($header, $versionGuard).Count -ne 1) {
+            throw "Could not uniquely locate cpp-httplib's Windows 10 minimum-version guard."
+          }
+          $header = [regex]::Replace($header, $versionGuard, "")
+
+          $replacements = @(
+            @{
+              Prefix = "      "
+              Old = @'
+                ::CreateFile2(wpath.c_str(), GENERIC_READ,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE, OPEN_EXISTING, NULL);
+          '@.Trim()
+              New = @'
+                ::CreateFileW(wpath.c_str(), GENERIC_READ,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
+                              FILE_ATTRIBUTE_NORMAL, NULL);
+          '@.Trim()
+            },
+            @{
+              Prefix = "      "
+              Old = @'
+                ::CreateFileMappingFromApp(hFile_, NULL, PAGE_READONLY, size_, NULL);
+          '@.Trim()
+              New = @'
+                ::CreateFileMappingW(hFile_, NULL, PAGE_READONLY,
+                                     static_cast<DWORD>(size_ >> 32),
+                                     static_cast<DWORD>(size_ & 0xFFFFFFFF), NULL);
+          '@.Trim()
+            },
+            @{
+              Prefix = "  addr_ = "
+              Old = "::MapViewOfFileFromApp(hMapping_, FILE_MAP_READ, 0, 0);"
+              New = "::MapViewOfFile(hMapping_, FILE_MAP_READ, 0, 0, 0);"
+            }
+          )
+
+          foreach ($replacement in $replacements) {
+            $old = $replacement.Prefix + $replacement.Old
+            $new = $replacement.Prefix + $replacement.New
+            if ([regex]::Matches($source, [regex]::Escape($old)).Count -ne 1) {
+              throw "Could not uniquely locate a cpp-httplib Windows 8+ file API call."
+            }
+            $source = $source.Replace($old, $new)
+          }
+
+          if ($header -match 'cpp-httplib doesn''t support Windows 8 or lower' -or
+              $source -match 'CreateFile2|CreateFileMappingFromApp|MapViewOfFileFromApp') {
+            throw "The cpp-httplib Windows 7 compatibility patch was incomplete."
+          }
+
+          [System.IO.File]::WriteAllText($headerPath, $header, $utf8NoBom)
+          [System.IO.File]::WriteAllText($sourcePath, $source, $utf8NoBom)
+
       - name: Install portable w64devkit
         if: steps.existing.outputs.exists != 'true'
         shell: pwsh
