@@ -6,7 +6,7 @@
 
 ## Как получить сборку
 
-Скачайте архив `llama.cpp-<версия>-win7-x64.zip` из [Releases](https://github.com/fhnb16/win7.llama.cpp/releases) и распакуйте его. Модели GGUF в архив не входят — их нужно загрузить отдельно.
+Скачайте CPU-архив `llama.cpp-<версия>-win7-x64.zip` из [Releases](https://github.com/fhnb16/win7.llama.cpp/releases) и распакуйте его. Если дополнительная сборка Vulkan завершилась успешно, в том же релизе будет архив `llama.cpp-<версия>-win7-x64-vulkan.zip`. Модели GGUF в архивы не входят — их нужно загрузить отдельно.
 
 Для запуска на Windows 7 добавьте параметр `--no-mmap`:
 
@@ -17,6 +17,8 @@ llama-server.exe -m model.gguf --no-mmap
 
 Это CPU-сборка для x64 на базе MinGW-w64/w64devkit с целевой версией Windows 7. Она не включает CUDA или другие GPU-бэкенды.
 
+Vulkan-вариант собирается отдельно и публикуется только при успешных установке SDK, сборке и проверке Win7 API. Для его запуска нужны совместимые с Windows 7 Vulkan-драйвер и runtime; они не входят в архив. Используйте `-ngl 99` для выгрузки слоёв на GPU. Если Vulkan-сборка не удалась, CPU-сборка всё равно публикуется.
+
 ## Автоматическая сборка
 
 Workflow [Windows 7 release](.github/workflows/windows-7-release.yml):
@@ -26,7 +28,8 @@ Workflow [Windows 7 release](.github/workflows/windows-7-release.yml):
 - собирает upstream-исходники с `WINVER` и `_WIN32_WINNT`, установленными в `0x0601`;
 - перед сборкой применяет проверяемый Win7-патч к vendored `cpp-httplib`: убирает ограничение библиотеки на Windows 10 и заменяет Win8+ API отображения файлов на `CreateFileW`, `CreateFileMappingW` и `MapViewOfFile`;
 - проверяет исполняемые файлы на импорты ряда WinAPI, недоступных в Windows 7;
-- создаёт релиз с тем же тегом, что у upstream, и прикладывает portable ZIP;
+- всегда собирает CPU-версию и создаёт релиз с тем же тегом, что у upstream;
+- дополнительно пытается собрать Vulkan-версию и прикладывает её отдельный portable ZIP только при успехе; сбой Vulkan не блокирует CPU-релиз;
 - пропускает сборку, если релиз с таким тегом уже опубликован.
 
 Перед сборкой workflow проверяет, опубликован ли уже релиз с upstream-тегом, и пропускает его, если он существует. Поэтому push запускает проверку, но не пересобирает и не перезаписывает уже собранную версию. Сборку также можно запустить вручную через **Actions → Windows 7 release → Run workflow**. Для публикации Actions требуется разрешение `contents: write`, заданное в workflow.

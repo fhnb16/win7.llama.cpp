@@ -303,6 +303,138 @@ jobs:
             }
           }
 
+      - name: Install Vulkan SDK
+        if: steps.existing.outputs.exists != 'true'
+        id: vulkan-sdk
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $winget = Get-Command winget.exe -ErrorAction SilentlyContinue
+          if ($null -eq $winget) {
+            throw "winget.exe is not available on the Windows runner."
+          }
+
+          & $winget.Source install `
+            --id KhronosGroup.VulkanSDK `
+            --exact `
+            --silent `
+            --accept-package-agreements `
+            --accept-source-agreements `
+            --disable-interactivity
+          if ($LASTEXITCODE -ne 0) {
+            throw "Vulkan SDK installation failed with exit code $LASTEXITCODE."
+          }
+
+          $sdk = Get-ChildItem -Path "C:\VulkanSDK" -Directory -ErrorAction SilentlyContinue |
+            Sort-Object Name -Descending |
+            Select-Object -First 1
+          if ($null -eq $sdk) {
+            throw "Vulkan SDK installation completed, but C:\VulkanSDK contains no SDK."
+          }
+          if (-not (Test-Path (Join-Path $sdk.FullName "Bin\glslc.exe"))) {
+            throw "glslc.exe was not found in Vulkan SDK $($sdk.FullName)."
+          }
+
+          "VULKAN_SDK=$($sdk.FullName)" >> $env:GITHUB_ENV
+          "vulkan_sdk=$($sdk.FullName)" >> $env:GITHUB_OUTPUT
+
+      - name: Configure optional Win7 Vulkan build
+        if: steps.existing.outputs.exists != 'true' && steps.vulkan-sdk.outcome == 'success'
+        id: vulkan-configure
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $win7Flags = "-D_WIN32_WINNT=0x0601 -DWINVER=0x0601"
+          cmake -S llama.cpp -B build-vulkan -G Ninja `
+            "-DCMAKE_C_COMPILER=$env:W64DEVKIT_BIN\gcc.exe" `
+            "-DCMAKE_CXX_COMPILER=$env:W64DEVKIT_BIN\g++.exe" `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DLLAMA_BUILD_IS_DEV=OFF `
+            -DLLAMA_BUILD_TESTS=OFF `
+            -DLLAMA_BUILD_SERVER=ON `
+            -DLLAMA_BUILD_TOOLS=ON `
+            -DLLAMA_OPENSSL=OFF `
+            -DBUILD_SHARED_LIBS=OFF `
+            -DGGML_NATIVE=OFF `
+            -DGGML_OPENMP=OFF `
+            -DGGML_VULKAN=ON `
+            "-DCMAKE_C_FLAGS=$win7Flags" `
+            "-DCMAKE_CXX_FLAGS=$win7Flags" `
+            "-DCMAKE_EXE_LINKER_FLAGS=-static -static-libgcc -static-libstdc++"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Vulkan CMake configuration failed with exit code $LASTEXITCODE."
+          }
+
+      - name: Build optional Win7 Vulkan version
+        if: steps.vulkan-configure.outcome == 'success'
+        id: vulkan-build
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          cmake --build build-vulkan --parallel 2
+          if ($LASTEXITCODE -ne 0) {
+            throw "Vulkan build failed with exit code $LASTEXITCODE."
+          }
+
+      - name: Verify Win7 API imports in Vulkan build
+        if: steps.vulkan-build.outcome == 'success'
+        id: vulkan-verify
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $executables = Get-ChildItem -Path "build-vulkan\bin" -Filter "*.exe" -File
+          foreach ($executable in $executables) {
+            $imports = & "$env:W64DEVKIT_BIN\objdump.exe" -p $executable.FullName
+            if ($LASTEXITCODE -ne 0) {
+              throw "Could not inspect imports in Vulkan executable $($executable.Name)."
+            }
+
+            $unsupported = $imports | Select-String `
+              -Pattern '\b(CreateFile2|CreateFileMappingFromApp|MapViewOfFileFromApp|SetThreadDescription)\b'
+            if ($unsupported) {
+              throw "$($executable.Name) imports APIs unavailable on Windows 7: $unsupported"
+            }
+          }
+
+      - name: Package optional Win7 Vulkan ZIP
+        if: steps.vulkan-verify.outcome == 'success'
+        id: package-vulkan
+        continue-on-error: true
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ steps.upstream.outputs.tag }}
+        run: |
+          $dist = Join-Path $env:RUNNER_TEMP "llama-win7-vulkan"
+          New-Item -ItemType Directory -Path $dist | Out-Null
+
+          $executables = Get-ChildItem -Path "build-vulkan\bin" -File |
+            Where-Object { $_.Extension -in @(".exe", ".dll") }
+          if (-not ($executables | Where-Object { $_.Name -eq "llama-cli.exe" })) {
+            throw "Vulkan build did not produce llama-cli.exe."
+          }
+          if (-not ($executables | Where-Object { $_.Name -eq "llama-server.exe" })) {
+            throw "Vulkan build did not produce llama-server.exe."
+          }
+          $executables | Copy-Item -Destination $dist
+
+          $readme = @"
+          llama.cpp $env:RELEASE_TAG - Windows 7 x64 (Vulkan)
+
+          This build includes the Vulkan backend. A Windows 7-compatible Vulkan
+          driver and Vulkan runtime must be installed for your graphics card.
+          On Windows 7, pass --no-mmap when running inference:
+
+            llama-cli.exe -m model.gguf --no-mmap -ngl 99 -p "Hello"
+            llama-server.exe -m model.gguf --no-mmap -ngl 99
+
+          This package does not include model files or a Vulkan driver.
+          "@
+          Set-Content -Path (Join-Path $dist "README.txt") -Value $readme -Encoding utf8
+          Copy-Item -Path "llama.cpp\LICENSE" -Destination $dist
+
+          $zip = "llama.cpp-$env:RELEASE_TAG-win7-x64-vulkan.zip"
+          Compress-Archive -Path "$dist\*" -DestinationPath $zip -CompressionLevel Optimal
+
       - name: Publish release
         if: steps.existing.outputs.exists != 'true'
         uses: softprops/action-gh-release@v2
@@ -313,6 +445,17 @@ jobs:
             Portable x64 CPU build of upstream llama.cpp ${{ steps.upstream.outputs.tag }} for Windows 7.
 
             Run `llama-cli.exe` or `llama-server.exe` with `--no-mmap` on Windows 7.
+            A separate Vulkan archive is included when its optional build succeeds.
           files: llama.cpp-${{ steps.upstream.outputs.tag }}-win7-x64.zip
+          fail_on_unmatched_files: true
+          overwrite_files: true
+
+      - name: Attach optional Vulkan ZIP
+        if: steps.existing.outputs.exists != 'true' && steps.package-vulkan.outcome == 'success'
+        continue-on-error: true
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.upstream.outputs.tag }}
+          files: llama.cpp-${{ steps.upstream.outputs.tag }}-win7-x64-vulkan.zip
           fail_on_unmatched_files: true
           overwrite_files: true
