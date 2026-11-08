@@ -22,11 +22,12 @@ llama-server.exe -m model.gguf --no-mmap
 Workflow [Windows 7 release](.github/workflows/windows-7-release.yml):
 
 - ежедневно в 06:17 UTC проверяет последний стабильный релиз llama.cpp;
+- запускается также при push в ветку `master`;
 - собирает upstream-исходники с `WINVER` и `_WIN32_WINNT`, установленными в `0x0601`;
 - проверяет исполняемые файлы на импорты ряда WinAPI, недоступных в Windows 7;
 - создаёт релиз с тем же тегом, что у upstream, и прикладывает portable ZIP;
 - пропускает сборку, если релиз с таким тегом уже опубликован.
 
-Сборку также можно запустить вручную через **Actions → Windows 7 release → Run workflow**. Для публикации Actions требуется разрешение `contents: write`, заданное в workflow.
+Перед сборкой workflow проверяет, опубликован ли уже релиз с upstream-тегом, и пропускает его, если он существует. Поэтому push запускает проверку, но не пересобирает и не перезаписывает уже собранную версию. Сборку также можно запустить вручную через **Actions → Windows 7 release → Run workflow**. Для публикации Actions требуется разрешение `contents: write`, заданное в workflow.
 
 Совместимость зависит от изменений в upstream llama.cpp и его зависимостях. Обсуждение причин несовместимости официальных бинарников и обходных путей: [llama.cpp discussion #28171](https://github.com/ggml-org/llama.cpp/discussions/28171); связанный PR по Windows 7: [llama.cpp PR #8208](https://github.com/ggml-org/llama.cpp/pull/8208).

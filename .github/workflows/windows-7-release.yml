@@ -1,6 +1,9 @@
 name: Windows 7 release
 
 on:
+  push:
+    branches:
+      - master
   schedule:
     - cron: "17 6 * * *"
   workflow_dispatch:
@@ -93,9 +96,21 @@ jobs:
           $archive = Join-Path $env:RUNNER_TEMP $asset.name
           $kitRoot = Join-Path $env:RUNNER_TEMP "w64devkit"
           Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $archive
-          & $archive "-o$kitRoot" -y
-          if ($LASTEXITCODE -ne 0) {
-            throw "w64devkit extraction failed with exit code $LASTEXITCODE."
+
+          $sevenZipCommand = Get-Command 7z.exe -ErrorAction SilentlyContinue
+          if ($null -ne $sevenZipCommand) {
+            $sevenZipPath = $sevenZipCommand.Source
+          } else {
+            $sevenZipPath = Join-Path $env:ProgramFiles "7-Zip\7z.exe"
+          }
+          if (-not (Test-Path $sevenZipPath)) {
+            throw "7z.exe was not found on the Windows runner."
+          }
+
+          & $sevenZipPath x $archive "-o$kitRoot" -y
+          $extractExitCode = $LASTEXITCODE
+          if ($null -eq $extractExitCode -or $extractExitCode -ne 0) {
+            throw "w64devkit extraction failed with exit code $extractExitCode."
           }
 
           $gcc = Get-ChildItem -Path $kitRoot -Filter gcc.exe -Recurse |
