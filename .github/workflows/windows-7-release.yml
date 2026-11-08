@@ -1,0 +1,211 @@
+name: Windows 7 release
+
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: windows-7-release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Find latest stable llama.cpp release
+        id: upstream
+        shell: pwsh
+        run: |
+          $headers = @{
+            Accept = "application/vnd.github+json"
+            "X-GitHub-Api-Version" = "2022-11-28"
+          }
+          $release = Invoke-RestMethod `
+            -Uri "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest" `
+            -Headers $headers
+
+          if ($release.tag_name -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$') {
+            throw "The latest llama.cpp release has an invalid tag."
+          }
+
+          "tag=$($release.tag_name)" >> $env:GITHUB_OUTPUT
+
+      - name: Skip an already published version
+        id: existing
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_TAG: ${{ steps.upstream.outputs.tag }}
+        run: |
+          $tag = $env:UPSTREAM_TAG
+          $headers = @{
+            Accept = "application/vnd.github+json"
+            Authorization = "Bearer $env:GH_TOKEN"
+            "X-GitHub-Api-Version" = "2022-11-28"
+          }
+          $uri = "https://api.github.com/repos/$env:GITHUB_REPOSITORY/releases/tags/$tag"
+
+          try {
+            Invoke-RestMethod -Uri $uri -Headers $headers | Out-Null
+            "exists=true" >> $env:GITHUB_OUTPUT
+            Write-Host "Release $tag already exists; skipping."
+          }
+          catch {
+            $statusCode = [int]$_.Exception.Response.StatusCode
+            if ($statusCode -ne 404) {
+              throw
+            }
+            "exists=false" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: Check out upstream release sources
+        if: steps.existing.outputs.exists != 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: ggml-org/llama.cpp
+          ref: ${{ steps.upstream.outputs.tag }}
+          path: llama.cpp
+          persist-credentials: false
+
+      - name: Install portable w64devkit
+        if: steps.existing.outputs.exists != 'true'
+        shell: pwsh
+        run: |
+          $headers = @{
+            Accept = "application/vnd.github+json"
+            "X-GitHub-Api-Version" = "2022-11-28"
+          }
+          $release = Invoke-RestMethod `
+            -Uri "https://api.github.com/repos/skeeto/w64devkit/releases/latest" `
+            -Headers $headers
+          $asset = $release.assets |
+            Where-Object { $_.name -match '^w64devkit-x64-.*\.7z\.exe$' } |
+            Select-Object -First 1
+
+          if ($null -eq $asset) {
+            throw "No x64 self-extracting w64devkit archive was found."
+          }
+
+          $archive = Join-Path $env:RUNNER_TEMP $asset.name
+          $kitRoot = Join-Path $env:RUNNER_TEMP "w64devkit"
+          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $archive
+          & $archive "-o$kitRoot" -y
+          if ($LASTEXITCODE -ne 0) {
+            throw "w64devkit extraction failed with exit code $LASTEXITCODE."
+          }
+
+          $gcc = Get-ChildItem -Path $kitRoot -Filter gcc.exe -Recurse |
+            Select-Object -First 1
+          if ($null -eq $gcc) {
+            throw "gcc.exe was not found in the extracted w64devkit archive."
+          }
+
+          $bin = $gcc.Directory.FullName
+          Add-Content -Path $env:GITHUB_PATH -Value $bin
+          "W64DEVKIT_BIN=$bin" >> $env:GITHUB_ENV
+
+      - name: Configure Win7 CPU build
+        if: steps.existing.outputs.exists != 'true'
+        shell: pwsh
+        run: |
+          $win7Flags = "-D_WIN32_WINNT=0x0601 -DWINVER=0x0601"
+          cmake -S llama.cpp -B build -G Ninja `
+            "-DCMAKE_C_COMPILER=$env:W64DEVKIT_BIN\gcc.exe" `
+            "-DCMAKE_CXX_COMPILER=$env:W64DEVKIT_BIN\g++.exe" `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DLLAMA_BUILD_IS_DEV=OFF `
+            -DLLAMA_BUILD_TESTS=OFF `
+            -DLLAMA_BUILD_SERVER=ON `
+            -DLLAMA_BUILD_TOOLS=ON `
+            -DLLAMA_OPENSSL=OFF `
+            -DBUILD_SHARED_LIBS=OFF `
+            -DGGML_NATIVE=OFF `
+            -DGGML_OPENMP=OFF `
+            "-DCMAKE_C_FLAGS=$win7Flags" `
+            "-DCMAKE_CXX_FLAGS=$win7Flags" `
+            "-DCMAKE_EXE_LINKER_FLAGS=-static -static-libgcc -static-libstdc++"
+          if ($LASTEXITCODE -ne 0) {
+            throw "CMake configuration failed with exit code $LASTEXITCODE."
+          }
+
+      - name: Build llama.cpp
+        if: steps.existing.outputs.exists != 'true'
+        shell: pwsh
+        run: |
+          cmake --build build --parallel 2
+          if ($LASTEXITCODE -ne 0) {
+            throw "Build failed with exit code $LASTEXITCODE."
+          }
+
+      - name: Package portable Win7 ZIP
+        if: steps.existing.outputs.exists != 'true'
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ steps.upstream.outputs.tag }}
+        run: |
+          $dist = Join-Path $env:RUNNER_TEMP "llama-win7"
+          New-Item -ItemType Directory -Path $dist | Out-Null
+
+          $executables = Get-ChildItem -Path "build\bin" -File |
+            Where-Object { $_.Extension -in @(".exe", ".dll") }
+          if (-not ($executables | Where-Object { $_.Name -eq "llama-cli.exe" })) {
+            throw "llama-cli.exe was not produced."
+          }
+          if (-not ($executables | Where-Object { $_.Name -eq "llama-server.exe" })) {
+            throw "llama-server.exe was not produced."
+          }
+          $executables | Copy-Item -Destination $dist
+
+          $readme = @"
+          llama.cpp $env:RELEASE_TAG - Windows 7 x64 (CPU)
+
+          This portable build targets Windows 7 using MinGW-w64/w64devkit.
+          On Windows 7, pass --no-mmap when running inference:
+
+            llama-cli.exe -m model.gguf --no-mmap -p "Hello"
+            llama-server.exe -m model.gguf --no-mmap
+
+          This package contains the built executables and required runtime DLLs,
+          if any. It does not include model files.
+          "@
+          Set-Content -Path (Join-Path $dist "README.txt") -Value $readme -Encoding utf8
+          Copy-Item -Path "llama.cpp\LICENSE" -Destination $dist
+
+          $zip = "llama.cpp-$env:RELEASE_TAG-win7-x64.zip"
+          Compress-Archive -Path "$dist\*" -DestinationPath $zip -CompressionLevel Optimal
+
+      - name: Verify Win7 API imports
+        if: steps.existing.outputs.exists != 'true'
+        shell: pwsh
+        run: |
+          $executables = Get-ChildItem -Path "build\bin" -Filter "*.exe" -File
+          foreach ($executable in $executables) {
+            $imports = & "$env:W64DEVKIT_BIN\objdump.exe" -p $executable.FullName
+            if ($LASTEXITCODE -ne 0) {
+              throw "Could not inspect imports in $($executable.Name)."
+            }
+
+            $unsupported = $imports | Select-String `
+              -Pattern '\b(CreateFile2|CreateFileMappingFromApp|MapViewOfFileFromApp|SetThreadDescription)\b'
+            if ($unsupported) {
+              throw "$($executable.Name) imports APIs unavailable on Windows 7: $unsupported"
+            }
+          }
+
+      - name: Publish release
+        if: steps.existing.outputs.exists != 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.upstream.outputs.tag }}
+          name: llama.cpp ${{ steps.upstream.outputs.tag }} (Windows 7)
+          body: |
+            Portable x64 CPU build of upstream llama.cpp ${{ steps.upstream.outputs.tag }} for Windows 7.
+
+            Run `llama-cli.exe` or `llama-server.exe` with `--no-mmap` on Windows 7.
+          files: llama.cpp-${{ steps.upstream.outputs.tag }}-win7-x64.zip
+          fail_on_unmatched_files: true
+          overwrite_files: true
