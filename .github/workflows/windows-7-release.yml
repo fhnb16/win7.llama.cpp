@@ -19,54 +19,92 @@ jobs:
   build:
     runs-on: windows-latest
     steps:
-      - name: Find latest stable llama.cpp release
+      - name: Select latest unbuilt llama.cpp release
         id: upstream
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           $headers = @{
             Accept = "application/vnd.github+json"
             "X-GitHub-Api-Version" = "2022-11-28"
           }
-          $release = Invoke-RestMethod `
-            -Uri "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest" `
+          $releases = Invoke-RestMethod `
+            -Uri "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=100" `
             -Headers $headers
+          $publishedReleases = $releases |
+            Where-Object { -not $_.draft -and $_.published_at } |
+            Sort-Object { [DateTimeOffset]$_.published_at } -Descending
+          $stable = $publishedReleases |
+            Where-Object { -not $_.prerelease } |
+            Select-Object -First 1
+          $latestPrerelease = $publishedReleases |
+            Where-Object { $_.prerelease } |
+            Select-Object -First 1
 
-          if ($release.tag_name -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$') {
-            throw "The latest llama.cpp release has an invalid tag."
+          if ($null -eq $stable -and $null -eq $latestPrerelease) {
+            throw "No published llama.cpp releases were found."
           }
 
-          "tag=$($release.tag_name)" >> $env:GITHUB_OUTPUT
-
-      - name: Skip an already published version
-        id: existing
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-          UPSTREAM_TAG: ${{ steps.upstream.outputs.tag }}
-        run: |
-          $tag = $env:UPSTREAM_TAG
-          $headers = @{
+          $targetHeaders = @{
             Accept = "application/vnd.github+json"
             Authorization = "Bearer $env:GH_TOKEN"
             "X-GitHub-Api-Version" = "2022-11-28"
           }
-          $uri = "https://api.github.com/repos/$env:GITHUB_REPOSITORY/releases/tags/$tag"
+          function Test-TargetReleaseExists {
+            param([string]$Tag)
 
-          try {
-            Invoke-RestMethod -Uri $uri -Headers $headers | Out-Null
-            "exists=true" >> $env:GITHUB_OUTPUT
-            Write-Host "Release $tag already exists; skipping."
-          }
-          catch {
-            $statusCode = [int]$_.Exception.Response.StatusCode
-            if ($statusCode -ne 404) {
+            $uri = "https://api.github.com/repos/$env:GITHUB_REPOSITORY/releases/tags/$Tag"
+            try {
+              Invoke-RestMethod -Uri $uri -Headers $targetHeaders | Out-Null
+              return $true
+            }
+            catch {
+              $statusCode = [int]$_.Exception.Response.StatusCode
+              if ($statusCode -eq 404) {
+                return $false
+              }
               throw
             }
-            "exists=false" >> $env:GITHUB_OUTPUT
           }
 
+          if ($null -ne $stable -and -not (Test-TargetReleaseExists $stable.tag_name)) {
+            $selected = $stable
+            $alreadyPublished = $false
+          } elseif ($null -ne $stable) {
+            $stableDate = [DateTimeOffset]$stable.published_at
+            $selected = $publishedReleases |
+              Where-Object {
+                $_.prerelease -and
+                ([DateTimeOffset]$_.published_at) -gt $stableDate
+              } |
+              Select-Object -First 1
+
+            if ($null -eq $selected) {
+              $selected = $stable
+              $alreadyPublished = $true
+            } else {
+              $alreadyPublished = Test-TargetReleaseExists $selected.tag_name
+            }
+          } else {
+            $selected = $latestPrerelease
+            $alreadyPublished = Test-TargetReleaseExists $selected.tag_name
+          }
+
+          if ($selected.tag_name -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$') {
+            throw "The selected llama.cpp release has an invalid tag."
+          }
+
+          "tag=$($selected.tag_name)" >> $env:GITHUB_OUTPUT
+          "prerelease=$($selected.prerelease.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          "exists=$($alreadyPublished.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          if ($alreadyPublished) {
+            Write-Host "Release $($selected.tag_name) is already published; skipping."
+          } else {
+            Write-Host "Selected upstream release $($selected.tag_name) (prerelease: $($selected.prerelease))."
+          }
       - name: Check out upstream release sources
-        if: steps.existing.outputs.exists != 'true'
+        if: steps.upstream.outputs.exists != 'true'
         uses: actions/checkout@v4
         with:
           repository: ggml-org/llama.cpp
@@ -75,7 +113,7 @@ jobs:
           persist-credentials: false
 
       - name: Patch cpp-httplib for Windows 7
-        if: steps.existing.outputs.exists != 'true'
+        if: steps.upstream.outputs.exists != 'true'
         shell: pwsh
         run: |
           $headerPath = "llama.cpp\vendor\cpp-httplib\httplib.h"
@@ -132,7 +170,7 @@ jobs:
           [System.IO.File]::WriteAllText($sourcePath, $source, $utf8NoBom)
 
       - name: Install portable w64devkit
-        if: steps.existing.outputs.exists != 'true'
+        if: steps.upstream.outputs.exists != 'true'
         shell: pwsh
         run: |
           $headers = @{
@@ -216,7 +254,7 @@ jobs:
           "W64DEVKIT_BIN=$bin" >> $env:GITHUB_ENV
 
       - name: Configure Win7 CPU build
-        if: steps.existing.outputs.exists != 'true'
+        if: steps.upstream.outputs.exists != 'true'
         shell: pwsh
         run: |
           $win7Flags = "-D_WIN32_WINNT=0x0601 -DWINVER=0x0601"
@@ -240,7 +278,7 @@ jobs:
           }
 
       - name: Build llama.cpp
-        if: steps.existing.outputs.exists != 'true'
+        if: steps.upstream.outputs.exists != 'true'
         shell: pwsh
         run: |
           cmake --build build --parallel 2
@@ -249,7 +287,7 @@ jobs:
           }
 
       - name: Package portable Win7 ZIP
-        if: steps.existing.outputs.exists != 'true'
+        if: steps.upstream.outputs.exists != 'true'
         shell: pwsh
         env:
           RELEASE_TAG: ${{ steps.upstream.outputs.tag }}
@@ -286,7 +324,7 @@ jobs:
           Compress-Archive -Path "$dist\*" -DestinationPath $zip -CompressionLevel Optimal
 
       - name: Verify Win7 API imports
-        if: steps.existing.outputs.exists != 'true'
+        if: steps.upstream.outputs.exists != 'true'
         shell: pwsh
         run: |
           $executables = Get-ChildItem -Path "build\bin" -Filter "*.exe" -File
@@ -304,7 +342,7 @@ jobs:
           }
 
       - name: Install Vulkan SDK
-        if: steps.existing.outputs.exists != 'true'
+        if: steps.upstream.outputs.exists != 'true'
         id: vulkan-sdk
         continue-on-error: true
         shell: pwsh
@@ -339,7 +377,7 @@ jobs:
           "vulkan_sdk=$($sdk.FullName)" >> $env:GITHUB_OUTPUT
 
       - name: Configure optional Win7 Vulkan build
-        if: steps.existing.outputs.exists != 'true' && steps.vulkan-sdk.outcome == 'success'
+        if: steps.upstream.outputs.exists != 'true' && steps.vulkan-sdk.outcome == 'success'
         id: vulkan-configure
         continue-on-error: true
         shell: pwsh
@@ -436,26 +474,29 @@ jobs:
           Compress-Archive -Path "$dist\*" -DestinationPath $zip -CompressionLevel Optimal
 
       - name: Publish release
-        if: steps.existing.outputs.exists != 'true'
+        if: steps.upstream.outputs.exists != 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.upstream.outputs.tag }}
           name: llama.cpp ${{ steps.upstream.outputs.tag }} (Windows 7)
+          prerelease: ${{ steps.upstream.outputs.prerelease == 'true' }}
           body: |
             Portable x64 CPU build of upstream llama.cpp ${{ steps.upstream.outputs.tag }} for Windows 7.
 
             Run `llama-cli.exe` or `llama-server.exe` with `--no-mmap` on Windows 7.
+            ${{ steps.upstream.outputs.prerelease == 'true' && 'This build follows an upstream prerelease.' || '' }}
             A separate Vulkan archive is included when its optional build succeeds.
           files: llama.cpp-${{ steps.upstream.outputs.tag }}-win7-x64.zip
           fail_on_unmatched_files: true
           overwrite_files: true
 
       - name: Attach optional Vulkan ZIP
-        if: steps.existing.outputs.exists != 'true' && steps.package-vulkan.outcome == 'success'
+        if: steps.upstream.outputs.exists != 'true' && steps.package-vulkan.outcome == 'success'
         continue-on-error: true
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.upstream.outputs.tag }}
+          prerelease: ${{ steps.upstream.outputs.prerelease == 'true' }}
           files: llama.cpp-${{ steps.upstream.outputs.tag }}-win7-x64-vulkan.zip
           fail_on_unmatched_files: true
           overwrite_files: true
