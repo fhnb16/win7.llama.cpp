@@ -143,10 +143,21 @@ jobs:
             return [regex]::Replace($Text, $Pattern, $Replacement)
           }
 
+          $canonicalizeOpen = '(?m)^([ \t]+)CREATEFILE2_EXTENDED_PARAMETERS params\{\};\n' +
+            '[ \t]+params\.dwSize = sizeof\(params\);\n' +
+            '[ \t]+params\.dwFileFlags = FILE_FLAG_BACKUP_SEMANTICS;[ \t]*(?://[^\n]*)?\n' +
+            '[ \t]+auto h = ::CreateFile2\(wpath\.c_str\(\),\s*0,\s*' +
+            'FILE_SHARE_READ\s*\|\s*FILE_SHARE_WRITE\s*\|\s*FILE_SHARE_DELETE,\s*OPEN_EXISTING,\s*&params\);'
+          $canonicalizeReplacement = '${1}auto h = ::CreateFileW(wpath.c_str(), 0,' +
+            "`n" + '${1}                       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,' +
+            "`n" + '${1}                       NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);'
+          $source = Replace-ExactlyOnce $source $canonicalizeOpen $canonicalizeReplacement `
+            "path canonicalization CreateFile2 block"
+
           $source = Replace-ExactlyOnce $source `
             '(?m)^(\s*)::CreateFile2\(wpath\.c_str\(\),\s*GENERIC_READ,\s*FILE_SHARE_READ\s*\|\s*FILE_SHARE_WRITE,\s*OPEN_EXISTING,\s*NULL\);' `
             '${1}::CreateFileW(wpath.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);' `
-            "CreateFile2 call"
+            "file mapping CreateFile2 call"
 
           $mappingReplacement = '${1}::CreateFileMappingW(hFile_, NULL, PAGE_READONLY,' +
             "`n" + '${1}                     static_cast<DWORD>(size_ >> 32),' +
@@ -161,9 +172,13 @@ jobs:
             '${1}addr_ = ::MapViewOfFile(hMapping_, FILE_MAP_READ, 0, 0, 0);' `
             "MapViewOfFileFromApp call"
 
-          if ($header -match 'cpp-httplib doesn''t support Windows 8 or lower' -or
-              $source -match 'CreateFile2|CreateFileMappingFromApp|MapViewOfFileFromApp') {
-            throw "The cpp-httplib Windows 7 compatibility patch was incomplete."
+          if ($header -match 'cpp-httplib doesn''t support Windows 8 or lower') {
+            throw "The cpp-httplib Windows 10 minimum-version guard is still present after patching."
+          }
+          $unsupportedApi = [regex]::Match("$header`n$source",
+            '\b(?:CreateFile2|CREATEFILE2_EXTENDED_PARAMETERS|CreateFileMappingFromApp|MapViewOfFileFromApp)\b')
+          if ($unsupportedApi.Success) {
+            throw "Unsupported Windows API identifier $($unsupportedApi.Value) remains in cpp-httplib after patching."
           }
 
           [System.IO.File]::WriteAllText($headerPath, $header, $utf8NoBom)
